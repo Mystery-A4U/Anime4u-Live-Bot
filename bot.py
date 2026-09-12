@@ -1,6 +1,8 @@
 import os
 import asyncio
 from pathlib import Path
+import shutil
+import subprocess
 
 from telegram import (
     Update,
@@ -85,6 +87,78 @@ MAX_FILE_SIZE = (
 # Number of folders shown per page
 
 PAGE_SIZE = 20
+
+
+# ============================================================
+# AUTO HLS REMUX + SUPABASE
+# ============================================================
+
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    ""
+)
+
+SUPABASE_SERVICE_ROLE_KEY = os.getenv(
+    "SUPABASE_SERVICE_ROLE_KEY",
+    ""
+)
+
+# Public base URL where B2 files are reachable.
+#
+# B2 native:
+#   https://f005.backblazeb2.com/file/YOUR_BUCKET
+#
+# or your Cloudflare CDN domain:
+#   https://cdn.yourdomain.com
+
+B2_PUBLIC_BASE_URL = os.getenv(
+    "B2_PUBLIC_BASE_URL",
+    ""
+).rstrip("/")
+
+
+# Automatically remux video files to HLS
+# before uploading (true/false)
+
+AUTO_HLS = (
+    os.getenv(
+        "AUTO_HLS",
+        "true"
+    ).lower()
+    == "true"
+)
+
+
+VIDEO_EXTENSIONS = {
+    ".mkv",
+    ".mp4",
+    ".avi",
+    ".webm",
+    ".mov",
+    ".m4v",
+    ".ts",
+    ".mpg",
+    ".mpeg",
+}
+
+
+supabase = None
+
+
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+
+    from supabase import create_client
+
+    supabase = create_client(
+        SUPABASE_URL,
+        SUPABASE_SERVICE_ROLE_KEY
+    )
+
+
+# Serialize heavy ffmpeg jobs so two
+# uploads never transcode at the same time
+
+transcode_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -705,6 +779,142 @@ async def handle_text(
 
 
 # ============================================================
+# FFMPEG HLS REMUX
+# ============================================================
+
+def remux_to_hls(
+    local_path: Path,
+    out_dir: Path,
+    slug: str
+) -> Path:
+
+    """
+    Copy the video stream (no re-encode),
+    re-encode audio to AAC, produce HLS.
+    """
+
+    out_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    playlist = (
+        out_dir / f"{slug}.m3u8"
+    )
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-i", str(local_path),
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-fflags", "+genpts",
+            "-hls_time", "6",
+            "-hls_playlist_type", "vod",
+            "-hls_segment_filename",
+            str(out_dir / f"{slug}_%03d.ts"),
+            str(playlist),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    return playlist
+
+
+# ============================================================
+# HLS CONTENT TYPES
+# ============================================================
+
+B2_CONTENT_TYPES = {
+    ".m3u8": "application/vnd.apple.mpegurl",
+    ".ts": "video/mp2t",
+    ".m4s": "video/iso.segment",
+    ".mp4": "video/mp4",
+}
+
+
+# ============================================================
+# UPLOAD HLS FOLDER
+# ============================================================
+
+def upload_hls_folder(
+    out_dir: Path,
+    b2_folder: str
+) -> str:
+
+    """
+    Upload every file produced by ffmpeg
+    into b2_folder on B2.
+
+    Returns the public URL of the playlist.
+    """
+
+    playlist_url = None
+
+
+    for f in sorted(
+        out_dir.iterdir()
+    ):
+
+        if not f.is_file():
+            continue
+
+
+        key = f"{b2_folder}/{f.name}"
+
+
+        bucket.upload_local_file(
+
+            local_file=str(f),
+
+            file_name=key,
+
+            content_type=(
+                B2_CONTENT_TYPES.get(
+                    f.suffix.lower()
+                )
+            ),
+        )
+
+
+        if f.suffix == ".m3u8":
+
+            playlist_url = (
+
+                f"{B2_PUBLIC_BASE_URL}/"
+                f"{key}"
+            )
+
+
+    return playlist_url
+
+
+# ============================================================
+# SUPABASE ROW INSERT
+# ============================================================
+
+def insert_stream_row(
+    title: str,
+    video_url: str
+) -> None:
+
+    supabase.table(
+        "streams"
+    ).insert({
+
+        "title": title,
+
+        "video_url": video_url,
+
+        "is_live": True,
+
+    }).execute()
+
+
+# ============================================================
 # FILE UPLOAD
 # ============================================================
 
@@ -908,6 +1118,271 @@ async def handle_file(
         )
 
         return
+
+
+    # ========================================================
+    # AUTO HLS REMUX + SUPABASE
+    # ========================================================
+
+    file_suffix = (
+        Path(safe_name)
+        .suffix
+        .lower()
+    )
+
+
+    if (
+        AUTO_HLS
+        and B2_PUBLIC_BASE_URL
+        and file_suffix in VIDEO_EXTENSIONS
+    ):
+
+        async with transcode_lock:
+
+            slug = (
+                Path(safe_name)
+                .stem
+            )
+
+            slug = "".join(
+
+                c
+                if (
+                    c.isalnum()
+                    or c in "-_"
+                )
+                else "_"
+
+                for c in slug
+            )
+
+
+            hls_dir = (
+
+                TEMP_DIR
+                / f"{slug}_hls"
+            )
+
+
+            # ------------------------------------------------
+            # REMUX
+            # ------------------------------------------------
+
+            try:
+
+                await status.edit_text(
+
+                    "🔄 *Remuxing to HLS...*\n\n"
+                    "Copying video stream, "
+                    "this takes a moment.",
+
+                    parse_mode="Markdown"
+                )
+
+
+                await asyncio.to_thread(
+
+                    remux_to_hls,
+
+                    local_path,
+
+                    hls_dir,
+
+                    slug
+                )
+
+
+            except Exception as error:
+
+                # ffmpeg failed — fall back to
+                # uploading the original file
+
+                await status.edit_text(
+
+                    "⚠️ Remux failed — uploading "
+                    "the original file instead.\n\n"
+
+                    f"`{str(error)[:500]}`",
+
+                    parse_mode="Markdown"
+                )
+
+
+                shutil.rmtree(
+
+                    hls_dir,
+
+                    ignore_errors=True
+                )
+
+
+            else:
+
+                # ------------------------------------------------
+                # UPLOAD HLS FILES
+                # ------------------------------------------------
+
+                b2_folder = (
+
+                    f"{folder_name}/{slug}"
+                )
+
+
+                await status.edit_text(
+
+                    "☁️ *Uploading HLS files "
+                    "to Backblaze B2...*",
+
+                    parse_mode="Markdown"
+                )
+
+
+                try:
+
+                    playlist_url = (
+
+                        await asyncio.to_thread(
+
+                            upload_hls_folder,
+
+                            hls_dir,
+
+                            b2_folder
+                        )
+                    )
+
+
+                except Exception as error:
+
+                    await status.edit_text(
+
+                        "❌ HLS upload failed.\n\n"
+                        f"`{str(error)[:800]}`",
+
+                        parse_mode="Markdown"
+                    )
+
+
+                    shutil.rmtree(
+
+                        hls_dir,
+
+                        ignore_errors=True
+                    )
+
+
+                    try:
+
+                        local_path.unlink()
+
+                    except OSError:
+
+                        pass
+
+
+                    return
+
+
+                # ------------------------------------------------
+                # SUPABASE ROW
+                # ------------------------------------------------
+
+                supabase_ok = False
+
+
+                if supabase and playlist_url:
+
+                    try:
+
+                        await asyncio.to_thread(
+
+                            insert_stream_row,
+
+                            Path(safe_name).stem,
+
+                            playlist_url
+                        )
+
+
+                        supabase_ok = True
+
+
+                    except Exception as error:
+
+                        print(
+                            "Supabase insert failed: "
+                            f"{error}"
+                        )
+
+
+                # ------------------------------------------------
+                # CLEANUP
+                # ------------------------------------------------
+
+                shutil.rmtree(
+
+                    hls_dir,
+
+                    ignore_errors=True
+                )
+
+
+                try:
+
+                    local_path.unlink()
+
+                except OSError:
+
+                    pass
+
+
+                # ------------------------------------------------
+                # SUCCESS MESSAGE
+                # ------------------------------------------------
+
+                message_text = (
+
+                    "✅ *UPLOAD COMPLETE*\n\n"
+
+                    f"📄 *File:*\n"
+                    f"`{safe_name}`\n\n"
+
+                    f"📁 *Folder:*\n"
+                    f"`{b2_folder}/`\n\n"
+
+                    f"🔗 *Playlist:*\n"
+                    f"`{playlist_url}`"
+                )
+
+
+                if supabase_ok:
+
+                    message_text += (
+
+                        "\n\n✨ Added to your "
+                        "streaming site."
+                    )
+
+
+                else:
+
+                    message_text += (
+
+                        "\n\n⚠️ Not added to "
+                        "Supabase — insert the row "
+                        "manually."
+                    )
+
+
+                await status.edit_text(
+
+                    message_text,
+
+                    parse_mode="Markdown"
+                )
+
+
+                return
 
 
     # ========================================================
